@@ -1,16 +1,16 @@
-import asyncio, sqlite3, logging, os
-from aiogram import Bot, Dispatcher, types
+import asyncio, sqlite3, logging
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient
-from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
 API_ID, API_HASH = 23451898, "f0e79c505bbcc7728505df9108cc3d22"
 BOT_TOKEN, ADMIN_ID = "8888017127:AAFywfUncgftwMA_f4JztHnf4L2fiIdtFWE", 7653039412
+PHONE = "+380680434161"
 
-# Инициализация БД
+# База данных
 conn = sqlite3.connect("bot_data.db")
 c = conn.cursor()
 c.execute("CREATE TABLE IF NOT EXISTS triggers (keyword TEXT PRIMARY KEY, file_id TEXT, delay INTEGER)")
@@ -23,72 +23,71 @@ conn.close()
 bot, dp = Bot(token=BOT_TOKEN), Dispatcher()
 client = TelegramClient('session_iphone', API_ID, API_HASH)
 
-phone_hash = {}
+# Состояние для ожидания кода авторизации
+user_auth_state = {}
 
-# Красивая веб-страница для твоего Айфона
-async def handle_index(request):
-    html = """
-    <html>
-    <head><title>Telegram Auth</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-    <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#1a1a1a; color:white;">
-        <h2>Авторизация Юзербота</h2>
-        <form action="/send_phone" method="get" style="margin-bottom:20px;">
-            <input type="text" name="phone" placeholder="+380..." style="padding:10px; width:200px;"><br><br>
-            <input type="submit" value="Отправить номер" style="padding:10px 20px; background:#2489ca; color:white; border:none; border-radius:5px;">
-        </form>
-        <form action="/send_code" method="get">
-            <input type="text" name="code" placeholder="Код из Телеграм" style="padding:10px; width:200px;"><br><br>
-            <input type="submit" value="Войти" style="padding:10px 20px; background:#52b350; color:white; border:none; border-radius:5px;">
-        </form>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
+def main_menu(uid):
+    b = InlineKeyboardBuilder()
+    b.button(text="🎵 Триггеры и Аудио", callback_data="menu_triggers")
+    b.button(text="💬 Разрешенные Чаты", callback_data="menu_chats")
+    b.adjust(1); return b.as_markup()
 
-async def handle_send_phone(request):
-    phone = request.query.get("phone")
-    if not phone: return web.Response(text="Введите номер!")
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    await m.answer("👋 Панель управления Юзерботом!\n\nЕсли запускаешь первый раз, нажми /auth чтобы войти в аккаунт.", reply_markup=main_menu(m.from_user.id))
+
+# Авторизация через обычного Бота
+@dp.message(Command("auth"))
+async def cmd_auth(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    await m.answer("⏳ Подключаюсь к Telegram API... Подожди пару секунд.")
     await client.connect()
-    res = await client.send_code_request(phone)
-    phone_hash['phone'] = phone
-    phone_hash['hash'] = res.phone_code_hash
-    return web.Response(text="Код отправлен! Вернитесь назад и введите код подтверждения.")
-
-async def handle_send_code(request):
-    code = request.query.get("code")
-    if not code: return web.Response(text="Введите код!")
-    await client.connect()
-    await client.sign_in(phone=phone_hash['phone'], code=code, phone_code_hash=phone_hash['hash'])
     
-    # Рестартуем бота в фоне после успешного входа
-    asyncio.create_task(start_bot_logic())
-    return web.Response(text="УСПЕШНО! Юзербот залогинился и запущен. Можете закрыть страницу.")
+    if await client.is_user_authorized():
+        await m.answer("✅ Юзербот уже успешно авторизован и работает!")
+        return
+        
+    # Отправляем запрос кода на твой номер
+    res = await client.send_code_request(PHONE)
+    user_auth_state["phone_code_hash"] = res.phone_code_hash
+    await m.answer("📩 Telegram отправил тебе код подтверждения в приложение. \n\n**Пришли мне этот код обычным сообщением в ответ.**")
 
-async def start_bot_logic():
-    print("--- ЮЗЕРБОТ УСПЕШНО ЗАПУЩЕН ИЗ ВЕБ-СЕССИИ ---")
-    await dp.start_polling(bot)
+@dp.message()
+async def handle_auth_code(m: types.Message):
+    if m.from_user.id != ADMIN_ID or "phone_code_hash" not in user_auth_state:
+        # Обычная обработка сообщений, если это не ввод кода
+        return
+
+    code = m.text.strip()
+    await m.answer(f"⚙️ Пробую войти с кодом {code}...")
+    
+    try:
+        await client.connect()
+        await client.sign_in(phone=PHONE, code=code, phone_code_hash=user_auth_state["phone_code_hash"])
+        await m.answer("🎉 УРА! Юзербот успешно залогинился и запущен!")
+        user_auth_state.clear()
+    except Exception as e:
+        await m.answer(f"❌ Ошибка входа: {e}\nПопробуй заново через /auth")
+
+# Работа триггеров юзербота
+@client.on(events.NewMessage(incoming=True))
+async def userbot_handler(e):
+    if not e.text: return
+    chat_id, text_lower = e.chat_id, e.text.lower()
+    conn = sqlite3.connect("bot_data.db")
+    is_allowed = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id=?", (chat_id,)).fetchone()
+    if not is_allowed: conn.close(); return
+    triggers = conn.execute("SELECT keyword, file_id, delay FROM triggers").fetchall(); conn.close()
+    for keyword, file_id, delay in triggers:
+        if keyword in text_lower:
+            if delay > 0: await asyncio.sleep(delay)
+            await e.reply(file=file_id); break
 
 async def main():
-    app = web.Application()
-    app.router.add_get('/', handle_index)
-    app.router.add_get('/send_phone', handle_send_phone)
-    app.router.add_get('/send_code', handle_send_code)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    await web.TCPSite(runner, '0.0.0.0', port).start()
-    print(f"Сайт авторизации запущен на порту {port}")
-    
-    # Проверяем, если сессия уже есть — запускаем бота сразу
-    await client.connect()
-    if await client.is_user_authorized():
-        print("Сессия найдена! Быстрый запуск...")
-        await dp.start_polling(bot)
-    else:
-        print("Сессия не найдена. Откройте сайт бота для авторизации.")
-        
-    while True: await asyncio.sleep(3600)
+    print("Запуск панели управления через бота...")
+    # Запускаем только бота aiogram, он не требует открытых портов
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
